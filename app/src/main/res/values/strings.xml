@@ -1,0 +1,32 @@
+<resources>
+    <string name="app_name">Project Bird</string>
+
+    <string name="nav_home">Home</string>
+    <string name="nav_analytics">Analytics</string>
+    <string name="nav_map">Map</string>
+    <string name="nav_history">History</string>
+    <string name="nav_session_detail">Session Detail</string>
+
+    <string name="home_title">Project Bird</string>
+    <string name="home_subtitle">Local biodiversity intelligence</string>
+
+    <string name="record_start">Start Recording</string>
+    <string name="record_stop">Stop Recording</string>
+    <string name="recording_status_idle">Ready to record</string>
+    <string name="recording_status_active">Recording in progress</string>
+    <string name="recording_status_background">Recording continues in the background</string>
+
+    <string name="service_channel_name">Recording</string>
+    <string name="service_channel_description">Notifications for active Project Bird recording sessions</string>
+    <string name="service_notification_title">Project Bird is recording</string>
+    <string name="service_notification_text">Audio capture is active in the background.</string>
+    <string name="service_notification_stop">Stop</string>
+
+    <string name="analytics_title">Analytics</string>
+    <string name="map_title">Map</string>
+    <string name="history_title">History</string>
+
+    <string name="empty_sessions">No sessions yet</string>
+    <string name="empty_analytics">No analytics available yet</string>
+    <string name="empty_map">No capture points to show yet</string>
+</resources>
