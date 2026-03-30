@@ -55,6 +55,7 @@ class RecordingForegroundService : Service() {
         maxOutputSize = BirdNetRuntimeConfig.TOP_K,
         enterConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_ENTER_THRESHOLD,
         exitConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_EXIT_THRESHOLD,
+        immediateAcceptanceThreshold = 0.70f,
     )
     private val slidingBuffer = FloatRingBuffer(BirdNetRuntimeConfig.WINDOW_SIZE_SAMPLES * 2)
 

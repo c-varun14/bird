@@ -2,10 +2,15 @@ package com.example.projectbird.core.processor
 
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.sqrt
 
 class BirdNetInputPreprocessor(
     private val targetSampleRateHz: Int = 48_000,
     private val preEmphasisAlpha: Float = 0.97f,
+    private val highPassAlpha: Float = BirdNetRuntimeConfig.HPF_ALPHA,
+    private val noiseGateFactor: Float = BirdNetRuntimeConfig.NOISE_GATE_FACTOR,
+    private val targetRms: Float = BirdNetRuntimeConfig.TARGET_RMS,
+    private val maxGain: Float = BirdNetRuntimeConfig.MAX_GAIN,
 ) {
 
     fun prepare(
@@ -24,6 +29,9 @@ class BirdNetInputPreprocessor(
             sourceRateHz = sourceSampleRateHz,
             targetRateHz = targetSampleRateHz,
         )
+        val highPassed = applyHighPassFilter(resampled)
+        val denoised = applyAdaptiveNoiseGate(highPassed)
+        val loudnessNormalized = normalizeLoudness(denoised)
 
         val noBatchShape = removeBatchDimension(inputShape)
         val expectedLength = when {
@@ -32,7 +40,7 @@ class BirdNetInputPreprocessor(
             else -> expectedElementCount
         }.coerceAtLeast(1)
 
-        return fitLength(resampled, expectedLength)
+        return fitLength(loudnessNormalized, expectedLength)
     }
 
     private fun normalizeWaveform(input: FloatArray): FloatArray {
@@ -53,6 +61,53 @@ class BirdNetInputPreprocessor(
         val peak = emphasized.maxOf { value -> abs(value) }.coerceAtLeast(1e-6f)
         return FloatArray(emphasized.size) { index ->
             (emphasized[index] / peak).coerceIn(-1f, 1f)
+        }
+    }
+
+    private fun applyHighPassFilter(input: FloatArray): FloatArray {
+        if (input.isEmpty()) return input
+
+        val output = FloatArray(input.size)
+        output[0] = input[0]
+
+        for (i in 1 until input.size) {
+            output[i] = highPassAlpha * (output[i - 1] + input[i] - input[i - 1])
+        }
+
+        return output
+    }
+
+    private fun applyAdaptiveNoiseGate(input: FloatArray): FloatArray {
+        if (input.isEmpty()) return input
+
+        val absValues = input.map { abs(it) }.sorted()
+        val medianNoiseFloor = absValues[(absValues.size * 0.5f).toInt().coerceIn(0, absValues.lastIndex)]
+        val gateThreshold = (medianNoiseFloor * noiseGateFactor).coerceAtLeast(1e-5f)
+
+        val output = FloatArray(input.size)
+        for (i in input.indices) {
+            val v = input[i]
+            val av = abs(v)
+            output[i] = if (av < gateThreshold) {
+                val attenuation = (av / gateThreshold).coerceIn(0f, 1f)
+                v * attenuation * attenuation
+            } else {
+                v
+            }
+        }
+
+        return output
+    }
+
+    private fun normalizeLoudness(input: FloatArray): FloatArray {
+        if (input.isEmpty()) return input
+
+        val rms = sqrt(input.sumOf { (it * it).toDouble() } / input.size.toDouble()).toFloat()
+        if (rms <= 1e-6f) return input
+
+        val gain = (targetRms / rms).coerceIn(1f, maxGain)
+        return FloatArray(input.size) { index ->
+            (input[index] * gain).coerceIn(-1f, 1f)
         }
     }
 

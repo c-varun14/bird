@@ -63,6 +63,7 @@ google-maps-utils = { group = "com.google.maps.android", name = "android-maps-ut
 google-maps-utils-ktx = { group = "com.google.maps.android", name = "maps-utils-ktx", version.ref = "mapsUtils" }
 
 tensorflow-lite = { group = "org.tensorflow", name = "tensorflow-lite", version.ref = "tflite" }
+tensorflow-lite-select-tf-ops = { group = "org.tensorflow", name = "tensorflow-lite-select-tf-ops", version.ref = "tflite" }
 
 
 [plugins]

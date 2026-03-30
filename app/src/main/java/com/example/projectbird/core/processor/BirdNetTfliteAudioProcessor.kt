@@ -10,6 +10,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import kotlin.math.exp
+import kotlin.math.max
 import kotlin.math.sqrt
 
 class BirdNetTfliteAudioProcessor(
@@ -36,6 +37,8 @@ class BirdNetTfliteAudioProcessor(
     private var outputElementCount: Int = 1
     private var inputBuffer: ByteBuffer? = null
     private var outputBuffer: Array<FloatArray>? = null
+    private var consecutiveInferenceFailures: Int = 0
+    private var lastInferenceError: String = "unknown"
     @Volatile
     private var fallbackReason: String = "BirdNET unavailable"
 
@@ -57,29 +60,39 @@ class BirdNetTfliteAudioProcessor(
             expectedElementCount = expectedInputElementCount,
         )
 
-        val reusableInputBuffer = inputBuffer ?: return@withContext fallbackWithWarning(input)
-        reusableInputBuffer.clear()
-        modelInput.forEach { value -> reusableInputBuffer.putFloat(value.coerceIn(-1f, 1f)) }
-        reusableInputBuffer.rewind()
+        val offsets = if (BirdNetRuntimeConfig.MULTI_OFFSET_ENABLED) {
+            BirdNetRuntimeConfig.MULTI_OFFSET_SAMPLES.asList()
+        } else {
+            listOf(0)
+        }
 
-        val reusableOutputBuffer = outputBuffer ?: return@withContext fallbackWithWarning(input)
-        reusableOutputBuffer[0].fill(0f)
+        val scoreFrames = mutableListOf<FloatArray>()
+        for (offset in offsets) {
+            val shifted = shiftWindow(modelInput, offset)
+            val scores = runSingleInference(localInterpreter, shifted)
+            if (scores != null) {
+                scoreFrames += scores
+            }
+        }
 
-        runCatching {
-            localInterpreter.run(reusableInputBuffer, reusableOutputBuffer)
-        }.getOrElse {
-            useFallback = true
-            fallbackReason = "BirdNET inference failed"
+        if (scoreFrames.isEmpty()) {
+            consecutiveInferenceFailures += 1
+            if (consecutiveInferenceFailures >= MAX_CONSECUTIVE_FAILURES) {
+                useFallback = true
+                fallbackReason = "BirdNET inference failed repeatedly: $lastInferenceError"
+            }
             return@withContext fallbackWithWarning(input)
         }
 
-        val scores = calibrateScores(reusableOutputBuffer[0])
+        consecutiveInferenceFailures = 0
+        val scores = fuseScoreFrames(scoreFrames)
 
         val detections = mutableListOf<DetectedItem>()
         for (index in 0 until outputElementCount) {
             val confidence = scores[index]
-            if (confidence < threshold) continue
             val name = labels.getOrElse(index) { "Bird #$index" }
+            val classThreshold = thresholdForLabel(name, threshold)
+            if (confidence < classThreshold) continue
             detections += DetectedItem(name, confidence.coerceIn(0f, 1f))
         }
 
@@ -95,6 +108,64 @@ class BirdNetTfliteAudioProcessor(
             environmentLabel = environmentFromIntensity(intensity),
             processorMode = ProcessorMode.BIRDNET,
         )
+    }
+
+    private fun runSingleInference(localInterpreter: Interpreter, modelInput: FloatArray): FloatArray? {
+        val reusableInputBuffer = inputBuffer ?: return null
+        val reusableOutputBuffer = outputBuffer ?: return null
+
+        reusableInputBuffer.clear()
+        modelInput.forEach { value -> reusableInputBuffer.putFloat(value.coerceIn(-1f, 1f)) }
+        reusableInputBuffer.rewind()
+
+        reusableOutputBuffer[0].fill(0f)
+
+        return runCatching {
+            localInterpreter.run(reusableInputBuffer, reusableOutputBuffer)
+            calibrateScores(reusableOutputBuffer[0]).copyOf()
+        }.onFailure {
+            lastInferenceError = it.message ?: it.javaClass.simpleName
+        }.getOrNull()
+    }
+
+    private fun fuseScoreFrames(frames: List<FloatArray>): FloatArray {
+        if (frames.isEmpty()) return FloatArray(outputElementCount)
+        if (frames.size == 1) return frames.first()
+
+        val output = FloatArray(outputElementCount)
+        for (i in 0 until outputElementCount) {
+            var weightedSum = 0f
+            var weightTotal = 0f
+            for (frameIndex in frames.indices) {
+                val weight = 1f + (frameIndex * 0.1f)
+                weightedSum += frames[frameIndex][i] * weight
+                weightTotal += weight
+            }
+            output[i] = (weightedSum / weightTotal.coerceAtLeast(1e-6f)).coerceIn(0f, 1f)
+        }
+        return output
+    }
+
+    private fun shiftWindow(input: FloatArray, shiftSamples: Int): FloatArray {
+        if (shiftSamples == 0 || input.isEmpty()) return input
+
+        val output = FloatArray(input.size)
+        for (i in output.indices) {
+            val sourceIndex = (i + shiftSamples).coerceIn(0, input.lastIndex)
+            output[i] = input[sourceIndex]
+        }
+        return output
+    }
+
+    private fun thresholdForLabel(label: String, baseThreshold: Float): Float {
+        val lower = label.lowercase()
+        val adjustment = when {
+            "sparrow" in lower || "warbler" in lower || "sunbird" in lower -> -0.03f
+            "owl" in lower || "nightjar" in lower -> -0.02f
+            "pigeon" in lower || "crow" in lower || "dove" in lower -> 0.03f
+            else -> 0f
+        }
+        return (baseThreshold + adjustment).coerceIn(0.08f, 0.65f)
     }
 
     @Synchronized
@@ -152,10 +223,12 @@ class BirdNetTfliteAudioProcessor(
                     .order(ByteOrder.nativeOrder())
                 outputBuffer = Array(1) { FloatArray(outputElementCount) }
             }
+            consecutiveInferenceFailures = 0
+            lastInferenceError = "none"
             initialized = true
         }.onFailure {
             useFallback = true
-            fallbackReason = "BirdNET model initialization failed"
+            fallbackReason = "BirdNET model initialization failed: ${it.message ?: "unknown"}"
             initialized = true
         }
     }
@@ -237,7 +310,8 @@ class BirdNetTfliteAudioProcessor(
         private const val MODEL_SAMPLE_RATE_HZ = 48_000
         private const val MIN_SUPPORTED_INPUT_SAMPLES = 96_000
         private const val MAX_SUPPORTED_INPUT_SAMPLES = 192_000
-        private val DEFAULT_NUM_THREADS = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+        private const val MAX_CONSECUTIVE_FAILURES = 3
+        private val DEFAULT_NUM_THREADS = max(1, Runtime.getRuntime().availableProcessors().coerceAtMost(2))
 
         private fun isSupportedWaveformInput(inputSamples: Int): Boolean {
             return inputSamples in MIN_SUPPORTED_INPUT_SAMPLES..MAX_SUPPORTED_INPUT_SAMPLES

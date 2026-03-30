@@ -95,6 +95,7 @@ dependencies {
     implementation(libs.google.maps.compose)
     implementation(libs.google.maps.utils)
     implementation(libs.tensorflow.lite)
+    implementation(libs.tensorflow.lite.select.tf.ops)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
