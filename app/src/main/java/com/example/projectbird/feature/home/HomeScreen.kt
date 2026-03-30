@@ -28,6 +28,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -48,6 +50,9 @@ data class HomeUiState(
     val environmentLabel: String = "Idle",
     val inferenceModeLabel: String = "Idle",
     val inferenceWarning: String? = null,
+    val overlapLikely: Boolean = false,
+    val overlapScore: Float = 0f,
+    val latencySummary: String = "Latency: --",
     val latestDetections: List<LiveDetection> = emptyList(),
     val permissionGuidance: String? = null,
     val amplitudeBars: List<Float> = listOf(
@@ -62,9 +67,12 @@ fun HomeScreen(
     onStopRecording: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val scrollState = rememberScrollState()
+
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(scrollState)
             .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
@@ -80,6 +88,9 @@ fun HomeScreen(
             environmentLabel = uiState.environmentLabel,
             inferenceModeLabel = uiState.inferenceModeLabel,
             inferenceWarning = uiState.inferenceWarning,
+            overlapLikely = uiState.overlapLikely,
+            overlapScore = uiState.overlapScore,
+            latencySummary = uiState.latencySummary,
         )
 
         WaveformCard(
@@ -147,6 +158,9 @@ private fun RecordingStatusCard(
     environmentLabel: String,
     inferenceModeLabel: String,
     inferenceWarning: String?,
+    overlapLikely: Boolean,
+    overlapScore: Float,
+    latencySummary: String,
 ) {
     Card(
         shape = RoundedCornerShape(24.dp),
@@ -202,6 +216,18 @@ private fun RecordingStatusCard(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            }
+
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer,
+            ) {
+                Text(
+                    text = "$latencySummary | Overlap ${if (overlapLikely) "likely" else "low"} (${(overlapScore * 100f).toInt()}%)",
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
             }
 

@@ -4,6 +4,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import com.example.projectbird.ProjectBirdApplication
 import com.example.projectbird.core.audio.AudioRecordStreamRecorder
 import com.example.projectbird.core.audio.FloatRingBuffer
@@ -14,10 +15,13 @@ import com.example.projectbird.core.processor.AudioProcessor
 import com.example.projectbird.core.processor.BirdNetTfliteAudioProcessor
 import com.example.projectbird.core.processor.BirdNetRuntimeConfig
 import com.example.projectbird.core.processor.DefaultMeaningfulnessEvaluator
-import com.example.projectbird.core.processor.BirdSpeciesPrior
+import com.example.projectbird.core.processor.MeaningfulnessEvaluator
+import com.example.projectbird.core.processor.OverlapAnalyzer
+import com.example.projectbird.core.processor.OverlapRefiner
 import com.example.projectbird.core.processor.ProcessorMode
 import com.example.projectbird.core.processor.ProcessingInput
 import com.example.projectbird.core.processor.TemporalDetectionSmoother
+import com.example.projectbird.core.processor.HeuristicOverlapRefiner
 import com.example.projectbird.core.storage.TempFileManager
 import com.example.projectbird.data.local.entity.AnalysisResultEntity
 import com.example.projectbird.data.local.entity.CapturePointEntity
@@ -35,6 +39,7 @@ import androidx.room.withTransaction
 import java.io.File
 import java.time.Instant
 import java.util.UUID
+import kotlin.math.roundToInt
 
 class RecordingForegroundService : Service() {
 
@@ -47,20 +52,11 @@ class RecordingForegroundService : Service() {
     private lateinit var tempFileManager: TempFileManager
     private lateinit var sessionStateStore: RecordingSessionStateStore
     private lateinit var audioProcessor: AudioProcessor
-    private val birdSpeciesPrior = BirdSpeciesPrior()
-    private val meaningfulnessEvaluator = DefaultMeaningfulnessEvaluator(
-        detectionConfidenceThreshold = BirdNetRuntimeConfig.DETECTION_THRESHOLD,
-    )
-    private val detectionSmoother = TemporalDetectionSmoother(
-        historySize = BirdNetRuntimeConfig.SMOOTHING_WINDOW_COUNT,
-        minFramesPresent = BirdNetRuntimeConfig.SMOOTHING_MIN_PRESENCE,
-        maxOutputSize = BirdNetRuntimeConfig.TOP_K,
-        enterConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_ENTER_THRESHOLD,
-        exitConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_EXIT_THRESHOLD,
-        immediateAcceptanceThreshold = 0.70f,
-        secondaryHoldFrames = BirdNetRuntimeConfig.SMOOTHING_SECONDARY_HOLD_FRAMES,
-        dominantSuppressionMargin = BirdNetRuntimeConfig.SMOOTHING_DOMINANT_SUPPRESSION_MARGIN,
-    )
+    private lateinit var meaningfulnessEvaluator: MeaningfulnessEvaluator
+    private val overlapRefiner: OverlapRefiner = HeuristicOverlapRefiner()
+    private lateinit var fastDetectionSmoother: TemporalDetectionSmoother
+    private lateinit var refinementDetectionSmoother: TemporalDetectionSmoother
+    private val latencyTracker = LatencyTracker()
     private val slidingBuffer = FloatRingBuffer(BirdNetRuntimeConfig.WINDOW_SIZE_SAMPLES * 2)
 
     private val appContainer by lazy {
@@ -79,6 +75,32 @@ class RecordingForegroundService : Service() {
             context = this,
             threshold = BirdNetRuntimeConfig.DETECTION_THRESHOLD,
             topK = BirdNetRuntimeConfig.TOP_K,
+            overlapMinOffsetsPresent = BirdNetRuntimeConfig.OVERLAP_MIN_OFFSETS_PRESENT,
+            overlapStrongSingleThreshold = BirdNetRuntimeConfig.OVERLAP_STRONG_SINGLE_THRESHOLD,
+            overlapFusionMaxWeight = BirdNetRuntimeConfig.OVERLAP_FUSION_MAX_WEIGHT,
+        )
+        meaningfulnessEvaluator = DefaultMeaningfulnessEvaluator(
+            detectionConfidenceThreshold = BirdNetRuntimeConfig.DETECTION_THRESHOLD,
+        )
+        fastDetectionSmoother = TemporalDetectionSmoother(
+            historySize = 3,
+            minFramesPresent = 2,
+            maxOutputSize = BirdNetRuntimeConfig.ADAPTIVE_TOP_K,
+            enterConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_ENTER_THRESHOLD,
+            exitConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_EXIT_THRESHOLD,
+            immediateAcceptanceThreshold = BirdNetRuntimeConfig.SMOOTHING_IMMEDIATE_ACCEPTANCE_THRESHOLD,
+            secondaryHoldFrames = BirdNetRuntimeConfig.SMOOTHING_SECONDARY_HOLD_FRAMES,
+            dominantSuppressionMargin = BirdNetRuntimeConfig.SMOOTHING_DOMINANT_SUPPRESSION_MARGIN,
+        )
+        refinementDetectionSmoother = TemporalDetectionSmoother(
+            historySize = BirdNetRuntimeConfig.SMOOTHING_WINDOW_COUNT,
+            minFramesPresent = BirdNetRuntimeConfig.SMOOTHING_MIN_PRESENCE,
+            maxOutputSize = BirdNetRuntimeConfig.TOP_K,
+            enterConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_ENTER_THRESHOLD,
+            exitConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_EXIT_THRESHOLD,
+            immediateAcceptanceThreshold = BirdNetRuntimeConfig.SMOOTHING_IMMEDIATE_ACCEPTANCE_THRESHOLD,
+            secondaryHoldFrames = BirdNetRuntimeConfig.SMOOTHING_SECONDARY_HOLD_FRAMES,
+            dominantSuppressionMargin = BirdNetRuntimeConfig.SMOOTHING_DOMINANT_SUPPRESSION_MARGIN,
         )
     }
 
@@ -130,7 +152,9 @@ class RecordingForegroundService : Service() {
             tempFileManager.clearAllTempFiles()
             locationProvider.start()
             streamingAudioRecorder.start()
-            detectionSmoother.reset()
+            fastDetectionSmoother.reset()
+            refinementDetectionSmoother.reset()
+            latencyTracker.reset()
             slidingBuffer.clear()
 
             RecordingRuntimeStateHolder.set(
@@ -140,7 +164,8 @@ class RecordingForegroundService : Service() {
                     sessionName = session.name,
                     sessionStartTimeMillis = session.startTime,
                     statusText = "Recording in progress",
-                    inferenceModeLabel = "Initializing BirdNET",
+                    inferenceModeLabel = "BirdNET v2.4 (Noise+Overlap)",
+                    latencySummary = "Latency: warming up",
                 )
             )
             sessionStateStore.markStarted(
@@ -167,6 +192,8 @@ class RecordingForegroundService : Service() {
     }
 
     private suspend fun processSlidingWindow(sessionId: String, sessionStart: Long) {
+        val loopStart = SystemClock.elapsedRealtimeNanos()
+
         val frame = streamingAudioRecorder.readFrame(BirdNetRuntimeConfig.HOP_SIZE_SAMPLES)
         slidingBuffer.append(frame.samples)
 
@@ -174,6 +201,8 @@ class RecordingForegroundService : Service() {
         val elapsed = (chunkTimestamp - sessionStart).coerceAtLeast(0L)
 
         if (slidingBuffer.size < BirdNetRuntimeConfig.WINDOW_SIZE_SAMPLES) {
+            val loopEnd = SystemClock.elapsedRealtimeNanos()
+            latencyTracker.record((loopEnd - loopStart) / 1_000_000L)
             RecordingRuntimeStateHolder.update {
                 it.copy(
                     isRecording = true,
@@ -185,6 +214,7 @@ class RecordingForegroundService : Service() {
                     inferenceModeLabel = "Warming up",
                     inferenceWarning = null,
                     statusText = "Warming up BirdNET",
+                    latencySummary = latencyTracker.summaryText(),
                 )
             }
             return
@@ -193,6 +223,7 @@ class RecordingForegroundService : Service() {
         val windowSamples = slidingBuffer.latest(BirdNetRuntimeConfig.WINDOW_SIZE_SAMPLES)
 
         val location = locationProvider.getLatestLocation()
+        val inferenceStart = SystemClock.elapsedRealtimeNanos()
         val rawResult = audioProcessor.process(
             ProcessingInput(
                 timestampMillis = chunkTimestamp,
@@ -204,25 +235,42 @@ class RecordingForegroundService : Service() {
                 sampleRateHz = BirdNetRuntimeConfig.SAMPLE_RATE_HZ,
             )
         )
+        val inferenceMs = ((SystemClock.elapsedRealtimeNanos() - inferenceStart) / 1_000_000L)
 
-        val rescoredDetections = if (rawResult.processorMode == ProcessorMode.BIRDNET) {
-            birdSpeciesPrior.rescore(
-                detections = rawResult.detectedItems,
-                latitude = location?.latitude,
-                longitude = location?.longitude,
-                timestampMillis = chunkTimestamp,
-            )
-        } else {
-            rawResult.detectedItems
-        }
+        val rescoredDetections = rawResult.detectedItems
 
         val stableDetections = if (rawResult.processorMode == ProcessorMode.BIRDNET) {
-            detectionSmoother.smooth(rescoredDetections)
+            fastDetectionSmoother.smooth(rescoredDetections)
         } else {
             emptyList()
         }
 
-        val stableResult = rawResult.copy(detectedItems = stableDetections)
+        val overlapSignal = OverlapAnalyzer.analyze(
+            detections = stableDetections,
+            strongThreshold = BirdNetRuntimeConfig.DETECTION_THRESHOLD,
+            triggerPolyphonyScore = BirdNetRuntimeConfig.OVERLAP_TRIGGER_POLYPHONY_SCORE,
+            triggerEntropy = BirdNetRuntimeConfig.OVERLAP_TRIGGER_ENTROPY,
+            triggerTop2Margin = BirdNetRuntimeConfig.OVERLAP_TRIGGER_TOP2_MARGIN,
+        )
+
+        val refinedDetections = if (
+            rawResult.processorMode == ProcessorMode.BIRDNET &&
+            overlapSignal.likelyOverlap
+        ) {
+            val refined = stableDetections
+                .sortedByDescending { it.confidence }
+                .take(BirdNetRuntimeConfig.ADAPTIVE_TOP_K)
+            val smoothed = refinementDetectionSmoother.smooth(refined)
+            overlapRefiner.refine(
+                detections = smoothed,
+                overlapSignal = overlapSignal,
+                maxOutputSize = BirdNetRuntimeConfig.TOP_K,
+            )
+        } else {
+            stableDetections
+        }
+
+        val stableResult = rawResult.copy(detectedItems = refinedDetections)
         val decision = meaningfulnessEvaluator.evaluate(stableResult)
 
         var persistedPath: String? = null
@@ -254,6 +302,9 @@ class RecordingForegroundService : Service() {
             }
         }
 
+        val loopEnd = SystemClock.elapsedRealtimeNanos()
+        latencyTracker.record((loopEnd - loopStart) / 1_000_000L)
+
         RecordingRuntimeStateHolder.update {
             it.copy(
                 isRecording = true,
@@ -273,16 +324,19 @@ class RecordingForegroundService : Service() {
                 },
                 environmentLabel = stableResult.environmentLabel.name.lowercase().replaceFirstChar { c -> c.uppercase() },
                 inferenceModeLabel = if (stableResult.processorMode == ProcessorMode.BIRDNET) {
-                    "BirdNET active"
+                    "BirdNET v2.4 (Noise+Overlap)"
                 } else {
                     "Fallback mode"
                 },
+                overlapLikely = overlapSignal.likelyOverlap,
+                overlapScore = overlapSignal.polyphonyScore,
                 inferenceWarning = stableResult.warningMessage,
+                latencySummary = latencyTracker.summaryText(inferenceMs = inferenceMs),
                 locationText = location?.let {
                     "Lat ${"%.5f".format(it.latitude)}, Lng ${"%.5f".format(it.longitude)}"
                 } ?: "Location unavailable",
                 statusText = if (stableResult.processorMode == ProcessorMode.BIRDNET) {
-                    "Recording in progress"
+                    "Recording in progress | Noise ${(stableResult.noiseScore * 100f).toInt()}% | SNR ${"%.1f".format(stableResult.snrDb)} dB"
                 } else {
                     "Recording (BirdNET unavailable)"
                 },
@@ -331,7 +385,7 @@ class RecordingForegroundService : Service() {
                         capturePointId = captureId,
                         processedAt = Instant.now().toEpochMilli(),
                         processorType = "BIRDNET_TFLITE",
-                        processorVersion = "1.1.0",
+                        processorVersion = "2.4.0",
                     )
                 )
 
@@ -380,7 +434,13 @@ class RecordingForegroundService : Service() {
         recordingJob?.cancel()
         recordingJob = null
         streamingAudioRecorder.stop()
-        detectionSmoother.reset()
+        if (::fastDetectionSmoother.isInitialized) {
+            fastDetectionSmoother.reset()
+        }
+        if (::refinementDetectionSmoother.isInitialized) {
+            refinementDetectionSmoother.reset()
+        }
+        latencyTracker.reset()
         slidingBuffer.clear()
         if (::sessionStateStore.isInitialized) {
             sessionStateStore.markStopped()
@@ -427,5 +487,37 @@ class RecordingForegroundService : Service() {
         @Volatile
         var isServiceRunning: Boolean = false
             private set
+    }
+
+    private class LatencyTracker(
+        private val capacity: Int = 30,
+    ) {
+        private val samplesMs = ArrayDeque<Long>()
+
+        fun record(totalMs: Long) {
+            val clamped = totalMs.coerceAtLeast(0L)
+            samplesMs.addLast(clamped)
+            while (samplesMs.size > capacity) {
+                samplesMs.removeFirst()
+            }
+        }
+
+        fun reset() {
+            samplesMs.clear()
+        }
+
+        fun summaryText(inferenceMs: Long? = null): String {
+            if (samplesMs.isEmpty()) return "Latency: --"
+            val sorted = samplesMs.sorted()
+            val p50 = sorted[sorted.size / 2]
+            val p95Index = ((sorted.size - 1) * 0.95f).roundToInt().coerceIn(0, sorted.lastIndex)
+            val p95 = sorted[p95Index]
+            val inf = inferenceMs?.coerceAtLeast(0L)
+            return if (inf == null) {
+                "Latency p50 ${p50}ms p95 ${p95}ms"
+            } else {
+                "Latency p50 ${p50}ms p95 ${p95}ms inf ${inf}ms"
+            }
+        }
     }
 }

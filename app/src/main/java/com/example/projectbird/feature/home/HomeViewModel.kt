@@ -62,6 +62,9 @@ class HomeViewModel(
                     environmentLabel = serviceState.environmentLabel,
                     inferenceModeLabel = serviceState.inferenceModeLabel,
                     inferenceWarning = serviceState.inferenceWarning,
+                    overlapLikely = serviceState.overlapLikely,
+                    overlapScore = serviceState.overlapScore,
+                    latencySummary = serviceState.latencySummary,
                     latestDetections = serviceState.latestDetections,
                     amplitudeBars = serviceState.latestAmplitudeBars.ifEmpty {
                         defaultAmplitudeBars()

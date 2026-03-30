@@ -56,12 +56,13 @@ class BirdNetTfliteAudioProcessor(
         val samples = input.pcmSamples ?: return@withContext fallbackWithWarning(input)
 
         val sourceRate = input.sampleRateHz ?: MODEL_SAMPLE_RATE_HZ
-        val modelInput = preprocessor.prepare(
+        val preparedInput = preprocessor.prepareDetailed(
             rawSamples = samples,
             sourceSampleRateHz = sourceRate,
             inputShape = inputTensorShape,
             expectedElementCount = expectedInputElementCount,
         )
+        val modelInput = preparedInput.modelInput
 
         val offsets = if (BirdNetRuntimeConfig.MULTI_OFFSET_ENABLED) {
             BirdNetRuntimeConfig.MULTI_OFFSET_SAMPLES.asList()
@@ -69,12 +70,29 @@ class BirdNetTfliteAudioProcessor(
             listOf(0)
         }
 
-        val scoreFrames = mutableListOf<FloatArray>()
+        val scoreFrames = mutableListOf<WeightedScores>()
+        val viewWeights = viewWeightsForNoise(preparedInput.diagnostics.noiseScore)
         for (offset in offsets) {
-            val shifted = shiftWindow(modelInput, offset)
-            val scores = runSingleInference(localInterpreter, shifted)
+            val shiftedMain = shiftWindow(modelInput, offset)
+            val shiftedDenoised = shiftWindow(preparedInput.denoisedInput, offset)
+            val shiftedBand = shiftWindow(preparedInput.bandEmphasizedInput, offset)
+
+            val scoresMain = runSingleInference(localInterpreter, shiftedMain)
+            if (scoresMain != null) {
+                scoreFrames += WeightedScores(scoresMain, viewWeights.main)
+            }
+            val scoresDenoised = runSingleInference(localInterpreter, shiftedDenoised)
+            if (scoresDenoised != null) {
+                scoreFrames += WeightedScores(scoresDenoised, viewWeights.denoised)
+            }
+            val scoresBand = runSingleInference(localInterpreter, shiftedBand)
+            if (scoresBand != null) {
+                scoreFrames += WeightedScores(scoresBand, viewWeights.band)
+            }
+
+            val scores = scoresMain
             if (scores != null) {
-                scoreFrames += scores
+                // already collected above
             }
         }
 
@@ -88,15 +106,21 @@ class BirdNetTfliteAudioProcessor(
         }
 
         consecutiveInferenceFailures = 0
-        val scores = fuseScoreFrames(scoreFrames)
-        val offsetPresence = offsetPresenceCounts(scoreFrames)
-        val maxScores = maxScoresByLabel(scoreFrames)
+        val flatScores = scoreFrames.map { it.scores }
+        val scores = MultiViewFusion.fuse(scoreFrames, outputElementCount)
+        val offsetPresence = offsetPresenceCounts(flatScores)
+        val maxScores = maxScoresByLabel(flatScores)
 
         val detections = mutableListOf<DetectedItem>()
         for (index in 0 until outputElementCount) {
             val confidence = scores[index]
             val name = labels.getOrElse(index) { "Bird #$index" }
-            val classThreshold = thresholdForLabel(name, threshold)
+            val classThreshold = adaptiveThresholdForLabel(
+                label = name,
+                baseThreshold = threshold,
+                noiseScore = preparedInput.diagnostics.noiseScore,
+                snrDb = preparedInput.diagnostics.estimatedSnrDb,
+            )
             if (!passesOverlapConsensus(confidence, maxScores[index], offsetPresence[index], classThreshold)) continue
             if (confidence < classThreshold) continue
             detections += DetectedItem(name, confidence.coerceIn(0f, 1f))
@@ -112,6 +136,8 @@ class BirdNetTfliteAudioProcessor(
             detectedItems = prunedDetections,
             intensity = intensity,
             environmentLabel = environmentFromIntensity(intensity),
+            noiseScore = preparedInput.diagnostics.noiseScore,
+            snrDb = preparedInput.diagnostics.estimatedSnrDb,
             processorMode = ProcessorMode.BIRDNET,
         )
     }
@@ -132,29 +158,6 @@ class BirdNetTfliteAudioProcessor(
         }.onFailure {
             lastInferenceError = it.message ?: it.javaClass.simpleName
         }.getOrNull()
-    }
-
-    private fun fuseScoreFrames(frames: List<FloatArray>): FloatArray {
-        if (frames.isEmpty()) return FloatArray(outputElementCount)
-        if (frames.size == 1) return frames.first()
-
-        val output = FloatArray(outputElementCount)
-        val maxWeight = overlapFusionMaxWeight.coerceIn(0.5f, 0.9f)
-        for (i in 0 until outputElementCount) {
-            var weightedSum = 0f
-            var weightTotal = 0f
-            var maxScore = 0f
-            for (frameIndex in frames.indices) {
-                val weight = 1f + (frameIndex * 0.1f)
-                val score = frames[frameIndex][i]
-                weightedSum += score * weight
-                weightTotal += weight
-                if (score > maxScore) maxScore = score
-            }
-            val mean = weightedSum / weightTotal.coerceAtLeast(1e-6f)
-            output[i] = (maxWeight * maxScore + (1f - maxWeight) * mean).coerceIn(0f, 1f)
-        }
-        return output
     }
 
     private fun offsetPresenceCounts(frames: List<FloatArray>): IntArray {
@@ -223,6 +226,33 @@ class BirdNetTfliteAudioProcessor(
             else -> 0f
         }
         return (baseThreshold + adjustment).coerceIn(0.08f, 0.65f)
+    }
+
+    private fun adaptiveThresholdForLabel(
+        label: String,
+        baseThreshold: Float,
+        noiseScore: Float,
+        snrDb: Float,
+    ): Float {
+        val classThreshold = thresholdForLabel(label, baseThreshold)
+        val noiseAdjust = when {
+            snrDb < 6f -> 0.08f
+            snrDb < 10f -> 0.05f
+            noiseScore > 0.65f -> 0.04f
+            noiseScore > 0.45f -> 0.02f
+            else -> 0f
+        }
+        return (classThreshold + noiseAdjust).coerceIn(0.10f, 0.75f)
+    }
+
+    private fun viewWeightsForNoise(noiseScore: Float): ViewWeights {
+        return if (noiseScore >= 0.60f) {
+            ViewWeights(main = 0.60f, denoised = 1.0f, band = 0.95f)
+        } else if (noiseScore >= 0.35f) {
+            ViewWeights(main = 0.85f, denoised = 1.0f, band = 0.75f)
+        } else {
+            ViewWeights(main = 1.0f, denoised = 0.70f, band = 0.60f)
+        }
     }
 
     @Synchronized
@@ -374,4 +404,10 @@ class BirdNetTfliteAudioProcessor(
             return inputSamples in MIN_SUPPORTED_INPUT_SAMPLES..MAX_SUPPORTED_INPUT_SAMPLES
         }
     }
+
+    private data class ViewWeights(
+        val main: Float,
+        val denoised: Float,
+        val band: Float,
+    )
 }

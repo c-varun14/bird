@@ -13,14 +13,48 @@ class BirdNetInputPreprocessor(
     private val maxGain: Float = BirdNetRuntimeConfig.MAX_GAIN,
 ) {
 
+    data class Diagnostics(
+        val estimatedNoiseFloor: Float,
+        val estimatedSignalRms: Float,
+        val estimatedSnrDb: Float,
+        val noiseScore: Float,
+    )
+
+    data class PreparedInput(
+        val modelInput: FloatArray,
+        val denoisedInput: FloatArray,
+        val bandEmphasizedInput: FloatArray,
+        val diagnostics: Diagnostics,
+    )
+
     fun prepare(
         rawSamples: FloatArray,
         sourceSampleRateHz: Int,
         inputShape: IntArray,
         expectedElementCount: Int,
     ): FloatArray {
+        return prepareDetailed(
+            rawSamples = rawSamples,
+            sourceSampleRateHz = sourceSampleRateHz,
+            inputShape = inputShape,
+            expectedElementCount = expectedElementCount,
+        ).modelInput
+    }
+
+    fun prepareDetailed(
+        rawSamples: FloatArray,
+        sourceSampleRateHz: Int,
+        inputShape: IntArray,
+        expectedElementCount: Int,
+    ): PreparedInput {
         if (rawSamples.isEmpty() || expectedElementCount <= 0) {
-            return FloatArray(expectedElementCount.coerceAtLeast(0))
+            val empty = FloatArray(expectedElementCount.coerceAtLeast(0))
+            return PreparedInput(
+                modelInput = empty,
+                denoisedInput = empty,
+                bandEmphasizedInput = empty,
+                diagnostics = Diagnostics(0f, 0f, 0f, 1f),
+            )
         }
 
         val normalized = normalizeWaveform(rawSamples)
@@ -30,8 +64,13 @@ class BirdNetInputPreprocessor(
             targetRateHz = targetSampleRateHz,
         )
         val highPassed = applyHighPassFilter(resampled)
+        val diagnostics = computeDiagnostics(highPassed)
+        val dynamicNoiseGateFactor = adjustedNoiseGateFactor(diagnostics)
+        val dynamicTargetRms = adjustedTargetRms(diagnostics)
         val denoised = applyAdaptiveNoiseGate(highPassed)
-        val loudnessNormalized = normalizeLoudness(denoised)
+        val denoisedAggressive = applyAdaptiveNoiseGate(highPassed, dynamicNoiseGateFactor)
+        val loudnessNormalized = normalizeLoudness(denoisedAggressive, dynamicTargetRms)
+        val bandEmphasized = applyBirdBandEmphasis(denoised)
 
         val noBatchShape = removeBatchDimension(inputShape)
         val expectedLength = when {
@@ -40,7 +79,12 @@ class BirdNetInputPreprocessor(
             else -> expectedElementCount
         }.coerceAtLeast(1)
 
-        return fitLength(loudnessNormalized, expectedLength)
+        return PreparedInput(
+            modelInput = fitLength(loudnessNormalized, expectedLength),
+            denoisedInput = fitLength(normalizeLoudness(denoised, dynamicTargetRms), expectedLength),
+            bandEmphasizedInput = fitLength(normalizeLoudness(bandEmphasized, dynamicTargetRms), expectedLength),
+            diagnostics = diagnostics,
+        )
     }
 
     private fun normalizeWaveform(input: FloatArray): FloatArray {
@@ -77,12 +121,12 @@ class BirdNetInputPreprocessor(
         return output
     }
 
-    private fun applyAdaptiveNoiseGate(input: FloatArray): FloatArray {
+    private fun applyAdaptiveNoiseGate(input: FloatArray, gateFactor: Float = noiseGateFactor): FloatArray {
         if (input.isEmpty()) return input
 
         val absValues = input.map { abs(it) }.sorted()
         val medianNoiseFloor = absValues[(absValues.size * 0.5f).toInt().coerceIn(0, absValues.lastIndex)]
-        val gateThreshold = (medianNoiseFloor * noiseGateFactor).coerceAtLeast(1e-5f)
+        val gateThreshold = (medianNoiseFloor * gateFactor).coerceAtLeast(1e-5f)
 
         val output = FloatArray(input.size)
         for (i in input.indices) {
@@ -99,16 +143,60 @@ class BirdNetInputPreprocessor(
         return output
     }
 
-    private fun normalizeLoudness(input: FloatArray): FloatArray {
+    private fun normalizeLoudness(input: FloatArray, preferredTargetRms: Float = targetRms): FloatArray {
         if (input.isEmpty()) return input
 
         val rms = sqrt(input.sumOf { (it * it).toDouble() } / input.size.toDouble()).toFloat()
         if (rms <= 1e-6f) return input
 
-        val gain = (targetRms / rms).coerceIn(1f, maxGain)
+        val gain = (preferredTargetRms / rms).coerceIn(1f, maxGain)
         return FloatArray(input.size) { index ->
             (input[index] * gain).coerceIn(-1f, 1f)
         }
+    }
+
+    private fun applyBirdBandEmphasis(input: FloatArray): FloatArray {
+        if (input.isEmpty()) return input
+        val output = FloatArray(input.size)
+        output[0] = input[0]
+        for (i in 1 until input.size) {
+            val hp = input[i] - (0.94f * input[i - 1])
+            val lp = 0.92f * output[i - 1] + 0.08f * hp
+            output[i] = (0.65f * hp + 0.35f * lp).coerceIn(-1f, 1f)
+        }
+        return output
+    }
+
+    private fun computeDiagnostics(input: FloatArray): Diagnostics {
+        if (input.isEmpty()) return Diagnostics(0f, 0f, 0f, 1f)
+        val absValues = input.map { abs(it) }.sorted()
+        val noiseFloor = absValues[(absValues.size * 0.2f).toInt().coerceIn(0, absValues.lastIndex)]
+        val rms = sqrt(input.sumOf { (it * it).toDouble() } / input.size.toDouble()).toFloat().coerceAtLeast(1e-6f)
+        val ratio = (rms / noiseFloor.coerceAtLeast(1e-4f)).coerceAtLeast(1f)
+        val snrDb = (20f * kotlin.math.log10(ratio)).coerceIn(0f, 40f)
+        val noiseScore = (1f - (snrDb / 20f)).coerceIn(0f, 1f)
+        return Diagnostics(
+            estimatedNoiseFloor = noiseFloor,
+            estimatedSignalRms = rms,
+            estimatedSnrDb = snrDb,
+            noiseScore = noiseScore,
+        )
+    }
+
+    private fun adjustedNoiseGateFactor(diagnostics: Diagnostics): Float {
+        return when {
+            diagnostics.estimatedSnrDb < 6f -> (noiseGateFactor * 1.45f)
+            diagnostics.estimatedSnrDb < 10f -> (noiseGateFactor * 1.25f)
+            else -> noiseGateFactor
+        }.coerceIn(1.1f, 2.2f)
+    }
+
+    private fun adjustedTargetRms(diagnostics: Diagnostics): Float {
+        return when {
+            diagnostics.noiseScore > 0.75f -> (targetRms * 0.85f)
+            diagnostics.noiseScore > 0.50f -> (targetRms * 0.92f)
+            else -> targetRms
+        }.coerceIn(0.07f, 0.14f)
     }
 
     private fun resampleToTargetRate(

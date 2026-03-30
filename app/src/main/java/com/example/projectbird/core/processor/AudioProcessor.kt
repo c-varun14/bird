@@ -17,6 +17,8 @@ data class DetectionResult(
     val detectedItems: List<DetectedItem>,
     val intensity: Float,
     val environmentLabel: EnvironmentLabel,
+    val noiseScore: Float = 0f,
+    val snrDb: Float = 0f,
     val processorMode: ProcessorMode = ProcessorMode.FALLBACK,
     val warningMessage: String? = null,
 )
