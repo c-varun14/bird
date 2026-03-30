@@ -73,6 +73,17 @@ interface DetectedEntityDao {
 
     @Query(
         """
+        SELECT ar.capturePointId AS capturePointId, de.entityName AS entityName, COUNT(de.id) AS detectionCount
+        FROM analysis_results ar
+        INNER JOIN detected_entities de ON de.analysisResultId = ar.id
+        GROUP BY ar.capturePointId, de.entityName
+        ORDER BY ar.capturePointId ASC, detectionCount DESC, de.entityName ASC
+        """
+    )
+    suspend fun getSpeciesCountsByCapturePoint(): List<CaptureSpeciesCountRow>
+
+    @Query(
+        """
         DELETE FROM detected_entities
         WHERE analysisResultId IN (
             SELECT id FROM analysis_results WHERE capturePointId IN (
@@ -94,5 +105,11 @@ data class EntityFrequencyRow(
 
 data class CaptureDetectionCountRow(
     val capturePointId: String,
+    val detectionCount: Int,
+)
+
+data class CaptureSpeciesCountRow(
+    val capturePointId: String,
+    val entityName: String,
     val detectionCount: Int,
 )

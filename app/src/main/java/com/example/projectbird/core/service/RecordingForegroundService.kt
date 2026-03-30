@@ -2,6 +2,7 @@ package com.example.projectbird.core.service
 
 import android.app.Service
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import com.example.projectbird.ProjectBirdApplication
 import com.example.projectbird.core.audio.AudioRecordStreamRecorder
@@ -44,6 +45,7 @@ class RecordingForegroundService : Service() {
     private lateinit var wavChunkWriter: WavChunkWriter
     private lateinit var locationProvider: FusedLocationProvider
     private lateinit var tempFileManager: TempFileManager
+    private lateinit var sessionStateStore: RecordingSessionStateStore
     private lateinit var audioProcessor: AudioProcessor
     private val birdSpeciesPrior = BirdSpeciesPrior()
     private val meaningfulnessEvaluator = DefaultMeaningfulnessEvaluator(
@@ -70,6 +72,7 @@ class RecordingForegroundService : Service() {
         wavChunkWriter = WavChunkWriter()
         locationProvider = FusedLocationProvider(this)
         tempFileManager = TempFileManager(this)
+        sessionStateStore = RecordingSessionStateStore(this)
         audioProcessor = BirdNetTfliteAudioProcessor(
             context = this,
             threshold = BirdNetRuntimeConfig.DETECTION_THRESHOLD,
@@ -93,6 +96,20 @@ class RecordingForegroundService : Service() {
         serviceScope.cancel()
         isServiceRunning = false
         super.onDestroy()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (recordingJob?.isActive == true) {
+            val restartIntent = Intent(applicationContext, RecordingForegroundService::class.java).apply {
+                action = ACTION_START
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                applicationContext.startForegroundService(restartIntent)
+            } else {
+                applicationContext.startService(restartIntent)
+            }
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun startRecordingForeground() {
@@ -124,10 +141,16 @@ class RecordingForegroundService : Service() {
                     inferenceModeLabel = "Initializing BirdNET",
                 )
             )
+            sessionStateStore.markStarted(
+                sessionId = session.id,
+                sessionName = session.name,
+                startedAtMillis = session.startTime,
+            )
 
             while (isActive) {
                 runCatching {
                     processSlidingWindow(session.id, session.startTime)
+                    sessionStateStore.markHeartbeat()
                 }.onFailure { error ->
                     RecordingRuntimeStateHolder.update {
                         it.copy(
@@ -357,6 +380,9 @@ class RecordingForegroundService : Service() {
         streamingAudioRecorder.stop()
         detectionSmoother.reset()
         slidingBuffer.clear()
+        if (::sessionStateStore.isInitialized) {
+            sessionStateStore.markStopped()
+        }
 
         serviceScope.launch {
             runCatching { locationProvider.stop() }

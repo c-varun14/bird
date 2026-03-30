@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.projectbird.ProjectBirdApplication
 import com.example.projectbird.core.service.RecordingRuntimeStateHolder
+import com.example.projectbird.core.service.RecordingSessionStateStore
 import com.example.projectbird.data.local.entity.SessionEntity
 import com.example.projectbird.data.repository.SessionRepository
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -12,6 +13,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import java.time.Instant
 import java.util.Locale
 import kotlin.math.absoluteValue
 
@@ -21,13 +23,32 @@ class HomeViewModel(
 
     private val sessionRepository: SessionRepository =
         (application as ProjectBirdApplication).appContainer.sessionRepository
+    private val sessionStateStore = RecordingSessionStateStore(application)
 
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
 
     init {
+        applyPersistedRecordingState()
         observeServiceState()
         observeActiveSession()
+    }
+
+    private fun applyPersistedRecordingState() {
+        val persisted = sessionStateStore.read()
+        if (!persisted.isRecording) return
+
+        val startedAt = persisted.startedAtMillis ?: return
+        val now = Instant.now().toEpochMilli()
+        val elapsed = (now - startedAt).coerceAtLeast(0L)
+
+        _uiState.value = _uiState.value.copy(
+            isRecording = true,
+            statusText = "Recording in background",
+            elapsedTimeText = formatElapsed(elapsed),
+            inferenceModeLabel = "Reconnecting to service",
+            inferenceWarning = null,
+        )
     }
 
     private fun observeServiceState() {
