@@ -10,10 +10,13 @@ class TemporalDetectionSmoother(
     private val exitConfidenceThreshold: Float = 0.16f,
     private val stabilityBoostPerFrame: Float = 0.03f,
     private val immediateAcceptanceThreshold: Float = 0.72f,
+    private val secondaryHoldFrames: Int = 2,
+    private val dominantSuppressionMargin: Float = 0.33f,
 ) {
 
     private val history = ArrayDeque<List<DetectedItem>>()
     private val activeSpecies = mutableSetOf<String>()
+    private val absentFrames = mutableMapOf<String, Int>()
 
     fun smooth(rawDetections: List<DetectedItem>): List<DetectedItem> {
         if (history.size >= historySize) {
@@ -42,6 +45,9 @@ class TemporalDetectionSmoother(
             }
         }
 
+        val dominantConfidence = currentFrameConfidence.values.maxOrNull() ?: 0f
+        val suppressionFloor = (dominantConfidence - dominantSuppressionMargin).coerceIn(0f, 1f)
+
         val smoothed = presenceCount.entries
             .asSequence()
             .filter {
@@ -57,8 +63,13 @@ class TemporalDetectionSmoother(
                 } else {
                     enterConfidenceThreshold
                 }
+                val current = currentFrameConfidence[name] ?: 0f
+                val suppressedByDominant =
+                    dominantConfidence >= enterConfidenceThreshold &&
+                        current > 0f &&
+                        current < suppressionFloor
 
-                if (boosted < threshold) {
+                if (boosted < threshold || suppressedByDominant) {
                     null
                 } else {
                     DetectedItem(
@@ -72,14 +83,42 @@ class TemporalDetectionSmoother(
             .take(maxOutputSize)
             .toList()
 
-        activeSpecies.clear()
-        activeSpecies.addAll(smoothed.map { it.entityName })
+        val heldSpecies = mutableListOf<DetectedItem>()
+        val existingNames = smoothed.map { it.entityName }.toMutableSet()
+        for (name in activeSpecies) {
+            if (existingNames.contains(name)) {
+                absentFrames.remove(name)
+                continue
+            }
 
-        return smoothed
+            val missingCount = (absentFrames[name] ?: 0) + 1
+            absentFrames[name] = missingCount
+            val current = currentFrameConfidence[name] ?: 0f
+            if (missingCount <= secondaryHoldFrames && current >= exitConfidenceThreshold) {
+                heldSpecies += DetectedItem(
+                    entityName = name,
+                    confidence = current,
+                )
+                existingNames.add(name)
+            }
+        }
+
+        val combined = (smoothed + heldSpecies)
+            .sortedByDescending { it.confidence }
+            .take(maxOutputSize)
+            .toList()
+
+        activeSpecies.clear()
+        activeSpecies.addAll(combined.map { it.entityName })
+        val activeSnapshot = activeSpecies.toSet()
+        absentFrames.keys.retainAll(activeSnapshot)
+
+        return combined
     }
 
     fun reset() {
         history.clear()
         activeSpecies.clear()
+        absentFrames.clear()
     }
 }

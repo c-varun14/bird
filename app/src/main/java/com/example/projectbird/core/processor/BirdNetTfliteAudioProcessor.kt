@@ -17,6 +17,9 @@ class BirdNetTfliteAudioProcessor(
     context: Context,
     private val threshold: Float = 0.20f,
     private val topK: Int = 6,
+    private val overlapMinOffsetsPresent: Int = BirdNetRuntimeConfig.OVERLAP_MIN_OFFSETS_PRESENT,
+    private val overlapStrongSingleThreshold: Float = BirdNetRuntimeConfig.OVERLAP_STRONG_SINGLE_THRESHOLD,
+    private val overlapFusionMaxWeight: Float = BirdNetRuntimeConfig.OVERLAP_FUSION_MAX_WEIGHT,
     private val fallbackProcessor: AudioProcessor = MockAudioProcessor(detectionThreshold = threshold),
 ) : AudioProcessor {
 
@@ -86,12 +89,15 @@ class BirdNetTfliteAudioProcessor(
 
         consecutiveInferenceFailures = 0
         val scores = fuseScoreFrames(scoreFrames)
+        val offsetPresence = offsetPresenceCounts(scoreFrames)
+        val maxScores = maxScoresByLabel(scoreFrames)
 
         val detections = mutableListOf<DetectedItem>()
         for (index in 0 until outputElementCount) {
             val confidence = scores[index]
             val name = labels.getOrElse(index) { "Bird #$index" }
             val classThreshold = thresholdForLabel(name, threshold)
+            if (!passesOverlapConsensus(confidence, maxScores[index], offsetPresence[index], classThreshold)) continue
             if (confidence < classThreshold) continue
             detections += DetectedItem(name, confidence.coerceIn(0f, 1f))
         }
@@ -133,17 +139,68 @@ class BirdNetTfliteAudioProcessor(
         if (frames.size == 1) return frames.first()
 
         val output = FloatArray(outputElementCount)
+        val maxWeight = overlapFusionMaxWeight.coerceIn(0.5f, 0.9f)
         for (i in 0 until outputElementCount) {
             var weightedSum = 0f
             var weightTotal = 0f
+            var maxScore = 0f
             for (frameIndex in frames.indices) {
                 val weight = 1f + (frameIndex * 0.1f)
-                weightedSum += frames[frameIndex][i] * weight
+                val score = frames[frameIndex][i]
+                weightedSum += score * weight
                 weightTotal += weight
+                if (score > maxScore) maxScore = score
             }
-            output[i] = (weightedSum / weightTotal.coerceAtLeast(1e-6f)).coerceIn(0f, 1f)
+            val mean = weightedSum / weightTotal.coerceAtLeast(1e-6f)
+            output[i] = (maxWeight * maxScore + (1f - maxWeight) * mean).coerceIn(0f, 1f)
         }
         return output
+    }
+
+    private fun offsetPresenceCounts(frames: List<FloatArray>): IntArray {
+        val presence = IntArray(outputElementCount)
+        if (frames.isEmpty()) return presence
+
+        for (classIndex in 0 until outputElementCount) {
+            var count = 0
+            for (frame in frames) {
+                if (frame[classIndex] >= threshold) count += 1
+            }
+            presence[classIndex] = count
+        }
+        return presence
+    }
+
+    private fun maxScoresByLabel(frames: List<FloatArray>): FloatArray {
+        val maxScores = FloatArray(outputElementCount)
+        if (frames.isEmpty()) return maxScores
+
+        for (classIndex in 0 until outputElementCount) {
+            var maxScore = 0f
+            for (frame in frames) {
+                if (frame[classIndex] > maxScore) {
+                    maxScore = frame[classIndex]
+                }
+            }
+            maxScores[classIndex] = maxScore
+        }
+        return maxScores
+    }
+
+    private fun passesOverlapConsensus(
+        fusedScore: Float,
+        maxOffsetScore: Float,
+        offsetsPresent: Int,
+        classThreshold: Float,
+    ): Boolean {
+        if (fusedScore < classThreshold) return false
+
+        val requiredOffsets = overlapMinOffsetsPresent.coerceAtLeast(1)
+        if (offsetsPresent >= requiredOffsets) return true
+
+        val singleStrongThreshold = overlapStrongSingleThreshold
+            .coerceIn(classThreshold, 1f)
+        return maxOffsetScore >= singleStrongThreshold
     }
 
     private fun shiftWindow(input: FloatArray, shiftSamples: Int): FloatArray {

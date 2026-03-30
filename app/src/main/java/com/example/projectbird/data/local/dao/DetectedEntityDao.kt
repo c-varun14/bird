@@ -63,6 +63,19 @@ interface DetectedEntityDao {
 
     @Query(
         """
+        SELECT de.entityName AS entityName, COUNT(*) AS detectionCount
+        FROM detected_entities de
+        INNER JOIN analysis_results ar ON de.analysisResultId = ar.id
+        INNER JOIN capture_points cp ON ar.capturePointId = cp.id
+        WHERE cp.sessionId = :sessionId
+        GROUP BY de.entityName
+        ORDER BY detectionCount DESC, de.entityName ASC
+        """
+    )
+    suspend fun getEntitiesForSession(sessionId: String): List<EntityFrequencyRow>
+
+    @Query(
+        """
         SELECT ar.capturePointId AS capturePointId, COUNT(de.id) AS detectionCount
         FROM analysis_results ar
         LEFT JOIN detected_entities de ON de.analysisResultId = ar.id

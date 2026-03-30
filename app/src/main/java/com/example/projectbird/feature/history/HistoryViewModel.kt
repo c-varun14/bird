@@ -42,7 +42,11 @@ class HistoryViewModel(
             val sessions = container.sessionRepository.observeSessionsSnapshot()
             val mapped = sessions.map { session ->
                 val captureCount = container.capturePointDao.getCaptureCountForSession(session.id)
-                val top = container.detectedEntityDao.getTopEntityForSession(session.id)?.entityName
+                val entities = container.detectedEntityDao.getEntitiesForSession(session.id)
+                val top = entities.firstOrNull()?.entityName
+                val allSpecies = if (entities.isEmpty()) null else entities.joinToString(
+                    separator = ", ",
+                ) { row -> "${row.entityName} (${row.detectionCount})" }
                 val endTime = session.endTime ?: Instant.now().toEpochMilli()
                 val duration = (endTime - session.startTime).coerceAtLeast(0L)
 
@@ -50,7 +54,7 @@ class HistoryViewModel(
                     id = session.id,
                     title = session.name,
                     subtitle = "${session.startTime.toReadableDate()} • ${duration.toDurationLabel()}",
-                    summary = "$captureCount meaningful captures • Top species: ${top ?: "-"}",
+                    summary = "$captureCount meaningful captures • Species: ${allSpecies ?: "-"}",
                 )
             }
             _uiState.value = HistoryUiState(sessions = mapped)
