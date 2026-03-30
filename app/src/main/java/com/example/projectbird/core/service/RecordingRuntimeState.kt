@@ -4,6 +4,17 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+data class LiveDetection(
+    val species: String,
+    val confidence: Float,
+    val source: DetectionSource,
+)
+
+enum class DetectionSource {
+    BIRDNET,
+    FALLBACK,
+}
+
 data class RecordingRuntimeState(
     val isRecording: Boolean = false,
     val activeSessionId: String? = null,
@@ -12,9 +23,11 @@ data class RecordingRuntimeState(
     val latestChunkTimestampMillis: Long? = null,
     val latestChunkFilePath: String? = null,
     val latestAmplitudeBars: List<Float> = DEFAULT_AMPLITUDE_BARS,
-    val latestDetections: List<String> = emptyList(),
+    val latestDetections: List<LiveDetection> = emptyList(),
     val elapsedTimeText: String = "00:00:00",
     val environmentLabel: String = "Idle",
+    val inferenceModeLabel: String = "Idle",
+    val inferenceWarning: String? = null,
     val locationText: String = "Location unavailable",
     val statusText: String = "Ready to record",
     val errorMessage: String? = null,

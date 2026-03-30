@@ -3,19 +3,28 @@ package com.example.projectbird.core.processor
 import java.io.File
 
 data class ProcessingInput(
-    val audioFile: File,
+    val audioFile: File? = null,
     val timestampMillis: Long,
     val latitude: Double?,
     val longitude: Double?,
     val durationMs: Long,
     val averageAmplitude: Float,
+    val pcmSamples: FloatArray? = null,
+    val sampleRateHz: Int? = null,
 )
 
 data class DetectionResult(
     val detectedItems: List<DetectedItem>,
     val intensity: Float,
     val environmentLabel: EnvironmentLabel,
+    val processorMode: ProcessorMode = ProcessorMode.FALLBACK,
+    val warningMessage: String? = null,
 )
+
+enum class ProcessorMode {
+    BIRDNET,
+    FALLBACK,
+}
 
 data class DetectedItem(
     val entityName: String,

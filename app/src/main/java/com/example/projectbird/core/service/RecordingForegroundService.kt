@@ -4,13 +4,19 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import com.example.projectbird.ProjectBirdApplication
-import com.example.projectbird.core.audio.AudioRecorder
-import com.example.projectbird.core.audio.MediaRecorderAudioRecorder
+import com.example.projectbird.core.audio.AudioRecordStreamRecorder
+import com.example.projectbird.core.audio.FloatRingBuffer
+import com.example.projectbird.core.audio.StreamingAudioRecorder
+import com.example.projectbird.core.audio.WavChunkWriter
 import com.example.projectbird.core.location.FusedLocationProvider
 import com.example.projectbird.core.processor.AudioProcessor
+import com.example.projectbird.core.processor.BirdNetTfliteAudioProcessor
+import com.example.projectbird.core.processor.BirdNetRuntimeConfig
 import com.example.projectbird.core.processor.DefaultMeaningfulnessEvaluator
-import com.example.projectbird.core.processor.MockAudioProcessor
+import com.example.projectbird.core.processor.BirdSpeciesPrior
+import com.example.projectbird.core.processor.ProcessorMode
 import com.example.projectbird.core.processor.ProcessingInput
+import com.example.projectbird.core.processor.TemporalDetectionSmoother
 import com.example.projectbird.core.storage.TempFileManager
 import com.example.projectbird.data.local.entity.AnalysisResultEntity
 import com.example.projectbird.data.local.entity.CapturePointEntity
@@ -24,6 +30,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import androidx.room.withTransaction
+import java.io.File
 import java.time.Instant
 import java.util.UUID
 
@@ -32,11 +40,23 @@ class RecordingForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var recordingJob: Job? = null
 
-    private lateinit var audioRecorder: AudioRecorder
+    private lateinit var streamingAudioRecorder: StreamingAudioRecorder
+    private lateinit var wavChunkWriter: WavChunkWriter
     private lateinit var locationProvider: FusedLocationProvider
     private lateinit var tempFileManager: TempFileManager
     private lateinit var audioProcessor: AudioProcessor
-    private val meaningfulnessEvaluator = DefaultMeaningfulnessEvaluator()
+    private val birdSpeciesPrior = BirdSpeciesPrior()
+    private val meaningfulnessEvaluator = DefaultMeaningfulnessEvaluator(
+        detectionConfidenceThreshold = BirdNetRuntimeConfig.DETECTION_THRESHOLD,
+    )
+    private val detectionSmoother = TemporalDetectionSmoother(
+        historySize = BirdNetRuntimeConfig.SMOOTHING_WINDOW_COUNT,
+        minFramesPresent = BirdNetRuntimeConfig.SMOOTHING_MIN_PRESENCE,
+        maxOutputSize = BirdNetRuntimeConfig.TOP_K,
+        enterConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_ENTER_THRESHOLD,
+        exitConfidenceThreshold = BirdNetRuntimeConfig.SMOOTHING_EXIT_THRESHOLD,
+    )
+    private val slidingBuffer = FloatRingBuffer(BirdNetRuntimeConfig.WINDOW_SIZE_SAMPLES * 2)
 
     private val appContainer by lazy {
         (application as ProjectBirdApplication).appContainer
@@ -45,10 +65,15 @@ class RecordingForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         RecordingNotificationFactory.ensureChannel(this)
-        audioRecorder = MediaRecorderAudioRecorder(this)
+        streamingAudioRecorder = AudioRecordStreamRecorder(sampleRateHz = BirdNetRuntimeConfig.SAMPLE_RATE_HZ)
+        wavChunkWriter = WavChunkWriter()
         locationProvider = FusedLocationProvider(this)
         tempFileManager = TempFileManager(this)
-        audioProcessor = MockAudioProcessor()
+        audioProcessor = BirdNetTfliteAudioProcessor(
+            context = this,
+            threshold = BirdNetRuntimeConfig.DETECTION_THRESHOLD,
+            topK = BirdNetRuntimeConfig.TOP_K,
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -63,7 +88,7 @@ class RecordingForegroundService : Service() {
 
     override fun onDestroy() {
         stopRecordingLoop()
-        audioRecorder.release()
+        streamingAudioRecorder.release()
         serviceScope.cancel()
         isServiceRunning = false
         super.onDestroy()
@@ -82,7 +107,11 @@ class RecordingForegroundService : Service() {
         recordingJob = serviceScope.launch {
             val session = appContainer.sessionRepository.getActiveSession()
                 ?: appContainer.sessionRepository.startSession()
+            tempFileManager.clearAllTempFiles()
             locationProvider.start()
+            streamingAudioRecorder.start()
+            detectionSmoother.reset()
+            slidingBuffer.clear()
 
             RecordingRuntimeStateHolder.set(
                 RecordingRuntimeState(
@@ -91,12 +120,13 @@ class RecordingForegroundService : Service() {
                     sessionName = session.name,
                     sessionStartTimeMillis = session.startTime,
                     statusText = "Recording in progress",
+                    inferenceModeLabel = "Initializing BirdNET",
                 )
             )
 
             while (isActive) {
                 runCatching {
-                    processSingleChunk(session.id, session.startTime)
+                    processSlidingWindow(session.id, session.startTime)
                 }.onFailure { error ->
                     RecordingRuntimeStateHolder.update {
                         it.copy(
@@ -110,65 +140,126 @@ class RecordingForegroundService : Service() {
         }
     }
 
-    private suspend fun processSingleChunk(sessionId: String, sessionStart: Long) {
-        val tempFile = tempFileManager.createTempAudioFile()
-        val chunkTimestamp = Instant.now().toEpochMilli()
+    private suspend fun processSlidingWindow(sessionId: String, sessionStart: Long) {
+        val frame = streamingAudioRecorder.readFrame(BirdNetRuntimeConfig.HOP_SIZE_SAMPLES)
+        slidingBuffer.append(frame.samples)
 
-        val recorded = runCatching {
-            audioRecorder.recordChunk(
-                outputFile = tempFile,
-                durationMs = CHUNK_DURATION_MS,
-            )
-        }.getOrElse {
-            tempFileManager.deleteTempFile(tempFile)
-            throw it
+        val chunkTimestamp = Instant.now().toEpochMilli()
+        val elapsed = (chunkTimestamp - sessionStart).coerceAtLeast(0L)
+
+        if (slidingBuffer.size < BirdNetRuntimeConfig.WINDOW_SIZE_SAMPLES) {
+            RecordingRuntimeStateHolder.update {
+                it.copy(
+                    isRecording = true,
+                    latestChunkTimestampMillis = chunkTimestamp,
+                    latestChunkFilePath = null,
+                    latestAmplitudeBars = amplitudeBarsFromIntensity(frame.rms),
+                    latestDetections = emptyList(),
+                    elapsedTimeText = elapsed.toClockString(),
+                    inferenceModeLabel = "Warming up",
+                    inferenceWarning = null,
+                    statusText = "Warming up BirdNET",
+                )
+            }
+            return
         }
 
+        val windowSamples = slidingBuffer.latest(BirdNetRuntimeConfig.WINDOW_SIZE_SAMPLES)
+
         val location = locationProvider.getLatestLocation()
-        val result = audioProcessor.process(
+        val rawResult = audioProcessor.process(
             ProcessingInput(
-                audioFile = recorded.file,
                 timestampMillis = chunkTimestamp,
                 latitude = location?.latitude,
                 longitude = location?.longitude,
-                durationMs = recorded.durationMs,
-                averageAmplitude = recorded.averageAmplitude,
+                durationMs = BirdNetRuntimeConfig.WINDOW_DURATION_MS,
+                averageAmplitude = frame.rms,
+                pcmSamples = windowSamples,
+                sampleRateHz = BirdNetRuntimeConfig.SAMPLE_RATE_HZ,
             )
         )
-        val decision = meaningfulnessEvaluator.evaluate(result)
 
-        if (decision.isMeaningful) {
-            persistMeaningfulChunk(
-                sessionId = sessionId,
-                chunkTimestamp = chunkTimestamp,
-                recordedFilePath = recorded.file.absolutePath,
-                durationMs = recorded.durationMs,
+        val rescoredDetections = if (rawResult.processorMode == ProcessorMode.BIRDNET) {
+            birdSpeciesPrior.rescore(
+                detections = rawResult.detectedItems,
                 latitude = location?.latitude,
                 longitude = location?.longitude,
-                intensity = result.intensity,
-                environmentLabel = mapEnvironment(result.environmentLabel),
-                retentionReason = mapRetention(decision.retentionReason),
-                detections = result.detectedItems,
+                timestampMillis = chunkTimestamp,
             )
         } else {
-            tempFileManager.deleteTempFile(recorded.file)
+            rawResult.detectedItems
         }
 
-        val elapsed = (chunkTimestamp - sessionStart).coerceAtLeast(0L)
+        val stableDetections = if (rawResult.processorMode == ProcessorMode.BIRDNET) {
+            detectionSmoother.smooth(rescoredDetections)
+        } else {
+            emptyList()
+        }
+
+        val stableResult = rawResult.copy(detectedItems = stableDetections)
+        val decision = meaningfulnessEvaluator.evaluate(stableResult)
+
+        var persistedPath: String? = null
+
+        if (decision.isMeaningful) {
+            val meaningfulFile = tempFileManager.createTempAudioFile(extension = "wav")
+            wavChunkWriter.writeMono16BitWav(
+                outputFile = meaningfulFile,
+                samples = windowSamples,
+                sampleRateHz = BirdNetRuntimeConfig.SAMPLE_RATE_HZ,
+            )
+            persistedPath = meaningfulFile.absolutePath
+
+            val persisted = persistMeaningfulChunk(
+                sessionId = sessionId,
+                chunkTimestamp = chunkTimestamp,
+                recordedFilePath = meaningfulFile.absolutePath,
+                durationMs = BirdNetRuntimeConfig.WINDOW_DURATION_MS,
+                latitude = location?.latitude,
+                longitude = location?.longitude,
+                intensity = stableResult.intensity,
+                environmentLabel = mapEnvironment(stableResult.environmentLabel),
+                retentionReason = mapRetention(decision.retentionReason),
+                detections = stableResult.detectedItems,
+            )
+            if (!persisted) {
+                tempFileManager.deleteTempFile(meaningfulFile)
+                persistedPath = null
+            }
+        }
+
         RecordingRuntimeStateHolder.update {
             it.copy(
                 isRecording = true,
                 latestChunkTimestampMillis = chunkTimestamp,
-                latestChunkFilePath = recorded.file.absolutePath,
-                latestAmplitudeBars = amplitudeBarsFromIntensity(result.intensity),
-                latestDetections = result.detectedItems.map { item ->
-                    "${item.entityName} - ${"%.2f".format(item.confidence)}"
+                latestChunkFilePath = persistedPath,
+                latestAmplitudeBars = amplitudeBarsFromIntensity(stableResult.intensity),
+                latestDetections = stableResult.detectedItems.map { item ->
+                    LiveDetection(
+                        species = item.entityName,
+                        confidence = item.confidence,
+                        source = if (stableResult.processorMode == ProcessorMode.BIRDNET) {
+                            DetectionSource.BIRDNET
+                        } else {
+                            DetectionSource.FALLBACK
+                        },
+                    )
                 },
-                environmentLabel = result.environmentLabel.name.lowercase().replaceFirstChar { c -> c.uppercase() },
+                environmentLabel = stableResult.environmentLabel.name.lowercase().replaceFirstChar { c -> c.uppercase() },
+                inferenceModeLabel = if (stableResult.processorMode == ProcessorMode.BIRDNET) {
+                    "BirdNET active"
+                } else {
+                    "Fallback mode"
+                },
+                inferenceWarning = stableResult.warningMessage,
                 locationText = location?.let {
                     "Lat ${"%.5f".format(it.latitude)}, Lng ${"%.5f".format(it.longitude)}"
                 } ?: "Location unavailable",
-                statusText = "Recording in progress",
+                statusText = if (stableResult.processorMode == ProcessorMode.BIRDNET) {
+                    "Recording in progress"
+                } else {
+                    "Recording (BirdNET unavailable)"
+                },
                 elapsedTimeText = elapsed.toClockString(),
                 errorMessage = null,
             )
@@ -186,46 +277,52 @@ class RecordingForegroundService : Service() {
         environmentLabel: EnvironmentLabel,
         retentionReason: RetentionReason,
         detections: List<com.example.projectbird.core.processor.DetectedItem>,
-    ) {
-        val captureId = UUID.randomUUID().toString()
-        appContainer.capturePointDao.insertCapturePoint(
-            CapturePointEntity(
-                id = captureId,
-                sessionId = sessionId,
-                timestamp = chunkTimestamp,
-                latitude = latitude,
-                longitude = longitude,
-                audioFilePath = recordedFilePath,
-                durationMs = durationMs,
-                intensity = intensity,
-                environmentLabel = environmentLabel,
-                retentionReason = retentionReason,
-            )
-        )
+    ): Boolean {
+        if (!File(recordedFilePath).exists()) return false
 
-        val analysisId = UUID.randomUUID().toString()
-        appContainer.analysisResultDao.insertAnalysisResult(
-            AnalysisResultEntity(
-                id = analysisId,
-                capturePointId = captureId,
-                processedAt = Instant.now().toEpochMilli(),
-                processorType = "MOCK",
-                processorVersion = "1.0",
-            )
-        )
+        return runCatching {
+            appContainer.database.withTransaction {
+                val captureId = UUID.randomUUID().toString()
+                appContainer.capturePointDao.insertCapturePoint(
+                    CapturePointEntity(
+                        id = captureId,
+                        sessionId = sessionId,
+                        timestamp = chunkTimestamp,
+                        latitude = latitude,
+                        longitude = longitude,
+                        audioFilePath = recordedFilePath,
+                        durationMs = durationMs,
+                        intensity = intensity,
+                        environmentLabel = environmentLabel,
+                        retentionReason = retentionReason,
+                    )
+                )
 
-        if (detections.isNotEmpty()) {
-            appContainer.detectedEntityDao.insertAll(
-                detections.map { detected ->
-                    DetectedEntityEntity(
-                        id = UUID.randomUUID().toString(),
-                        analysisResultId = analysisId,
-                        entityName = detected.entityName,
-                        confidence = detected.confidence,
+                val analysisId = UUID.randomUUID().toString()
+                appContainer.analysisResultDao.insertAnalysisResult(
+                    AnalysisResultEntity(
+                        id = analysisId,
+                        capturePointId = captureId,
+                        processedAt = Instant.now().toEpochMilli(),
+                        processorType = "BIRDNET_TFLITE",
+                        processorVersion = "1.1.0",
+                    )
+                )
+
+                if (detections.isNotEmpty()) {
+                    appContainer.detectedEntityDao.insertAll(
+                        detections.map { detected ->
+                            DetectedEntityEntity(
+                                id = UUID.randomUUID().toString(),
+                                analysisResultId = analysisId,
+                                entityName = detected.entityName,
+                                confidence = detected.confidence,
+                            )
+                        }
                     )
                 }
-            )
-        }
+            }
+        }.isSuccess
     }
 
     private fun mapRetention(reason: com.example.projectbird.core.processor.RetentionReason?): RetentionReason {
@@ -256,6 +353,9 @@ class RecordingForegroundService : Service() {
     private fun stopRecordingLoop() {
         recordingJob?.cancel()
         recordingJob = null
+        streamingAudioRecorder.stop()
+        detectionSmoother.reset()
+        slidingBuffer.clear()
 
         serviceScope.launch {
             runCatching { locationProvider.stop() }
@@ -294,7 +394,6 @@ class RecordingForegroundService : Service() {
     companion object {
         const val ACTION_START = "com.example.projectbird.action.START_RECORDING"
         const val ACTION_STOP = "com.example.projectbird.action.STOP_RECORDING"
-        private const val CHUNK_DURATION_MS = 2_000L
 
         @Volatile
         var isServiceRunning: Boolean = false

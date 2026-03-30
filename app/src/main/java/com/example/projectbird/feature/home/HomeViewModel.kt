@@ -39,6 +39,8 @@ class HomeViewModel(
                     elapsedTimeText = serviceState.elapsedTimeText,
                     locationText = serviceState.locationText,
                     environmentLabel = serviceState.environmentLabel,
+                    inferenceModeLabel = serviceState.inferenceModeLabel,
+                    inferenceWarning = serviceState.inferenceWarning,
                     latestDetections = serviceState.latestDetections,
                     amplitudeBars = serviceState.latestAmplitudeBars.ifEmpty {
                         defaultAmplitudeBars()

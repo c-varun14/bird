@@ -14,7 +14,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             ProjectBirdTheme {
-                ProjectBirdApp()
+                   ProjectBirdApp()
             }
         }
     }

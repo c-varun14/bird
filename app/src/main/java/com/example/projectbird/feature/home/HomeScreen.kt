@@ -35,6 +35,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.example.projectbird.core.service.LiveDetection
+import com.example.projectbird.core.service.DetectionSource
 import com.example.projectbird.ui.theme.ProjectBirdTheme
 
 @Immutable
@@ -44,7 +46,9 @@ data class HomeUiState(
     val elapsedTimeText: String = "00:00:00",
     val locationText: String = "Location unavailable",
     val environmentLabel: String = "Idle",
-    val latestDetections: List<String> = emptyList(),
+    val inferenceModeLabel: String = "Idle",
+    val inferenceWarning: String? = null,
+    val latestDetections: List<LiveDetection> = emptyList(),
     val permissionGuidance: String? = null,
     val amplitudeBars: List<Float> = listOf(
         0.12f, 0.35f, 0.20f, 0.55f, 0.30f, 0.42f, 0.24f, 0.50f
@@ -74,6 +78,8 @@ fun HomeScreen(
             elapsedTimeText = uiState.elapsedTimeText,
             locationText = uiState.locationText,
             environmentLabel = uiState.environmentLabel,
+            inferenceModeLabel = uiState.inferenceModeLabel,
+            inferenceWarning = uiState.inferenceWarning,
         )
 
         WaveformCard(
@@ -139,6 +145,8 @@ private fun RecordingStatusCard(
     elapsedTimeText: String,
     locationText: String,
     environmentLabel: String,
+    inferenceModeLabel: String,
+    inferenceWarning: String?,
 ) {
     Card(
         shape = RoundedCornerShape(24.dp),
@@ -183,6 +191,32 @@ private fun RecordingStatusCard(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
+            ) {
+                Text(
+                    text = "Inference: $inferenceModeLabel",
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            }
+
+            inferenceWarning?.let { warning ->
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.errorContainer,
+                ) {
+                    Text(
+                        text = warning,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                }
             }
         }
     }
@@ -349,7 +383,7 @@ private fun RecordingControls(
 
 @Composable
 private fun LiveDetectionsCard(
-    detections: List<String>,
+    detections: List<LiveDetection>,
     isRecording: Boolean,
 ) {
     Card(
@@ -390,7 +424,7 @@ private fun LiveDetectionsCard(
                             color = MaterialTheme.colorScheme.surfaceVariant,
                         ) {
                             Text(
-                                text = detection,
+                                text = "${detection.species} - ${(detection.confidence * 100f).toInt()}%",
                                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
                                 style = MaterialTheme.typography.bodyLarge,
                                 color = MaterialTheme.colorScheme.onSurface,
@@ -436,9 +470,9 @@ private fun HomeScreenRecordingPreview() {
                 locationText = "Lat 12.9716, Lng 77.5946",
                 environmentLabel = "Active",
                 latestDetections = listOf(
-                    "Sparrow • 0.82",
-                    "Myna • 0.74",
-                    "Crow • 0.68",
+                    LiveDetection("Sparrow", 0.82f, DetectionSource.BIRDNET),
+                    LiveDetection("Myna", 0.74f, DetectionSource.BIRDNET),
+                    LiveDetection("Crow", 0.68f, DetectionSource.BIRDNET),
                 ),
             ),
             onStartRecording = {},

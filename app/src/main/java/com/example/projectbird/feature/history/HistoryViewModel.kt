@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -42,7 +43,8 @@ class HistoryViewModel(
             val mapped = sessions.map { session ->
                 val captureCount = container.capturePointDao.getCaptureCountForSession(session.id)
                 val top = container.detectedEntityDao.getTopEntityForSession(session.id)?.entityName
-                val duration = (session.endTime ?: session.startTime) - session.startTime
+                val endTime = session.endTime ?: Instant.now().toEpochMilli()
+                val duration = (endTime - session.startTime).coerceAtLeast(0L)
 
                 SessionHistoryItem(
                     id = session.id,
@@ -61,7 +63,15 @@ class HistoryViewModel(
     }
 
     private fun Long.toDurationLabel(): String {
-        val mins = (coerceAtLeast(0L) / 60_000L)
-        return "$mins min"
+        val duration = Duration.ofMillis(coerceAtLeast(0L))
+        val hours = duration.toHours()
+        val minutes = duration.toMinutes() % 60
+        val seconds = duration.seconds % 60
+
+        return when {
+            hours > 0 -> "${hours}h ${minutes}m"
+            minutes > 0 -> "${minutes}m ${seconds}s"
+            else -> "${seconds}s"
+        }
     }
 }
